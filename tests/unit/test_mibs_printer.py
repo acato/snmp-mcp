@@ -109,9 +109,79 @@ async def test_printer_status_happy_path(monkeypatch, fake_session) -> None:
 
 
 async def test_printer_status_unsupported(monkeypatch, fake_session) -> None:
-    async def fake_get(_session, _oids):
-        return [("1.3.6.1.2.1.43.5.1.1.2.1.1", None, "noSuchInstance")]
+    """Both supplies and input walks empty → ``SnmpUnsupported``.
 
-    monkeypatch.setattr(transport, "_perform_get", fake_get)
+    Reflects the post-polish semantics: we no longer pre-flight
+    ``prtGeneralPrinterStatus.1.1`` (some printers — notably the OKI
+    C530dn over v1 — implement the supplies and input tables but not
+    that scalar). The empty-table signal is the real "no PRINTER-MIB".
+    """
+
+    async def fake_bulk(_session, oid, _max):
+        # Every walk hits endOfMibView immediately → 0 rows everywhere.
+        return [(oid + ".0", None, "endOfMibView")]
+
+    monkeypatch.setattr(transport, "_perform_bulk", fake_bulk)
     with pytest.raises(SnmpUnsupported):
         await printer_status(fake_session)
+
+
+async def test_printer_status_v1_no_general_status(monkeypatch, fake_session) -> None:
+    """v1 printer with no ``prtGeneralPrinterStatus.1.1`` still returns ok.
+
+    Reproduces the OKI C530dn shape: ``prtMarkerSuppliesTable`` walks
+    fine, the post-walk opportunistic GET of ``prtGeneralPrinterStatus``
+    raises ``SnmpNoSuchName`` (v1 all-or-nothing). The wrapper should
+    swallow the noSuchName, leave ``printer_status=None``, surface the
+    supplies, and surface a single warning.
+    """
+    from snmp_mcp.errors import SnmpNoSuchName
+
+    # Mark the session as v1 so the wrapper exercises the v1 path. The
+    # transport layer doesn't actually read this field; the only place
+    # version matters here is the (mocked) GET that we make raise.
+    fake_session.host_cfg.version = "v1"
+
+    supplies_rows = [
+        ("1.3.6.1.2.1.43.11.1.1.1.1.1", 1, "Integer"),
+        ("1.3.6.1.2.1.43.11.1.1.5.1.1", 3, "Integer"),  # toner
+        ("1.3.6.1.2.1.43.11.1.1.6.1.1", "Yellow Toner", "OctetString"),
+        ("1.3.6.1.2.1.43.11.1.1.7.1.1", 19, "Integer"),  # percent
+        ("1.3.6.1.2.1.43.11.1.1.8.1.1", 100, "Integer"),
+        ("1.3.6.1.2.1.43.11.1.1.9.1.1", 10, "Integer"),
+    ]
+
+    state = {
+        "1.3.6.1.2.1.43.11.1": iter(supplies_rows),
+    }
+
+    async def fake_walk_step(_session, oid, *_args):
+        # v1 has no GETBULK, so snmp_walk falls back to GETNEXT.
+        # Reuse one stepper for both _perform_next and _perform_bulk
+        # for resilience against future call-shape changes.
+        for prefix, it in state.items():
+            if oid.startswith(prefix):
+                try:
+                    return [next(it)]
+                except StopIteration:
+                    return [(prefix + ".999", None, "endOfMibView")]
+        return [(oid + ".0", None, "endOfMibView")]
+
+    async def fake_get(_session, _oids):
+        raise SnmpNoSuchName(
+            "noSuchName (errorStatus=2, errorIndex=1)",
+            host="testhost",
+        )
+
+    monkeypatch.setattr(transport, "_perform_next", fake_walk_step)
+    monkeypatch.setattr(transport, "_perform_bulk", fake_walk_step)
+    monkeypatch.setattr(transport, "_perform_get", fake_get)
+
+    result = await printer_status(fake_session)
+    d = result["data"]
+    assert d["printer_status"] is None
+    assert len(d["supplies"]) == 1
+    assert d["supplies"][0]["descr"] == "Yellow Toner"
+    assert d["supplies"][0]["current_level"] == 10
+    # The noSuchName-on-prtGeneralPrinterStatus was absorbed as a warning.
+    assert any("noSuchName" in w for w in result["warnings"])

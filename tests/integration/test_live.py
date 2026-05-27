@@ -18,9 +18,14 @@ Required env vars when running:
   - ``SNMP_MCP_LIVE_PRIV_PROTO``   — for v3 (optional)
   - ``SNMP_MCP_LIVE_PRIV_PASS``    — for v3 (optional)
 
-Optional env var:
-  - ``SNMP_MCP_LIVE_PRINTER_HOST`` — separate host alias for the printer
-    integration test; if unset, printer test is skipped.
+Optional env var groups:
+  - ``SNMP_MCP_LIVE_PRINTER_HOST`` (+ ``ADDRESS`` / ``COMMUNITY`` / ...)
+    — separate host alias for the v2c printer integration test; if
+    unset, that test is skipped.
+  - ``SNMP_MCP_LIVE_V1_HOST`` (+ ``ADDRESS`` / ``COMMUNITY`` / ...) — a
+    third host alias used for the SNMPv1 coverage tests (``device_detect``
+    + ``printer_status`` against a minimally-conformant v1 agent). If
+    unset, those tests are skipped.
 """
 
 from __future__ import annotations
@@ -73,6 +78,25 @@ def _live_printer_cfg() -> HostConfig | None:
     )
 
 
+def _live_v1_cfg() -> HostConfig | None:
+    """Build a HostConfig for the optional v1 integration target.
+
+    Returns None if ``SNMP_MCP_LIVE_V1_HOST`` is unset, in which case
+    the v1-specific tests are skipped. Defaults version to ``v1``.
+    """
+    name = os.environ.get("SNMP_MCP_LIVE_V1_HOST")
+    if not name:
+        return None
+    return HostConfig(
+        name=name,
+        address=os.environ.get("SNMP_MCP_LIVE_V1_ADDRESS", name),
+        version=os.environ.get("SNMP_MCP_LIVE_V1_VERSION", "v1"),
+        community=os.environ.get("SNMP_MCP_LIVE_V1_COMMUNITY", "public"),
+        timeout=float(os.environ.get("SNMP_MCP_LIVE_V1_TIMEOUT", "5.0")),
+        retries=int(os.environ.get("SNMP_MCP_LIVE_V1_RETRIES", "2")),
+    )
+
+
 @pytest.fixture(scope="module")
 def live_session():
     cfg = _live_host_cfg()
@@ -86,6 +110,16 @@ def live_printer_session():
     cfg = _live_printer_cfg()
     if cfg is None:
         pytest.skip("SNMP_MCP_LIVE_PRINTER_HOST not set")
+    cfg.validate()
+    cache = SessionCache()
+    return cache.get(cfg)
+
+
+@pytest.fixture(scope="module")
+def live_v1_session():
+    cfg = _live_v1_cfg()
+    if cfg is None:
+        pytest.skip("SNMP_MCP_LIVE_V1_HOST not set")
     cfg.validate()
     cache = SessionCache()
     return cache.get(cfg)
@@ -165,3 +199,36 @@ async def test_live_printer_status(live_printer_session) -> None:
     result = await printer_status(live_printer_session)
     # Even an idle printer reports a status enum.
     assert result["data"]["printer_status"] is not None
+
+
+# --- v1 coverage -------------------------------------------------------------
+#
+# These tests guard the SNMPv1 polish: ``device_detect`` and ``printer_status``
+# must survive a minimally-conformant v1 agent that returns ``noSuchName`` on
+# any unimplemented OID. Gated on ``SNMP_MCP_LIVE_V1_HOST``.
+
+
+async def test_live_v1_device_detect(live_v1_session) -> None:
+    """``device_detect`` must succeed on v1 even when one probe OID is absent."""
+    result = await device_detect(live_v1_session)
+    d = result["data"]
+    assert d["sys_object_id"] is not None
+    assert "SNMPv2-MIB" in d["supported_mibs"]
+
+
+async def test_live_v1_printer_status(live_v1_session) -> None:
+    """``printer_status`` must return populated supplies on a v1 printer.
+
+    The agent need not expose ``prtGeneralPrinterStatus.1.1``; the
+    rowcount of ``prtMarkerSuppliesTable`` is the real signal.
+    """
+    result = await printer_status(live_v1_session)
+    d = result["data"]
+    assert isinstance(d["supplies"], list)
+    assert len(d["supplies"]) >= 1, "expected at least one supplies row"
+    # At least one supply should have a non-None, non-sentinel level.
+    measured = [
+        s for s in d["supplies"]
+        if s["current_level"] is not None and s["current_level"] >= 0
+    ]
+    assert measured, "expected at least one supply with a measured level"

@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import oids
-from ..errors import SnmpUnsupported
+from ..errors import SnmpNoSuchName, SnmpUnsupported
 from ..session import HostSession
 from ..transport import snmp_get, snmp_table
 
@@ -28,27 +28,17 @@ _LEVEL_NOT_MEASURED = -3
 async def printer_status(session: HostSession) -> dict[str, Any]:
     """Return supplies + trays + bins + alerts for a printer.
 
-    Raises ``SnmpUnsupported`` if the agent does not implement PRINTER-MIB.
+    Raises ``SnmpUnsupported`` if the agent does not implement PRINTER-MIB
+    (signalled by empty walks of both the supplies and the input-tray
+    tables).
     """
-    # Probe with a small GET first; many printers expose
-    # prtGeneralPrinterStatus.1.1 as the first conformant row.
-    probe = await snmp_get(session, [oids.PRT_GENERAL_PRINTER_STATUS + ".1.1"])
-    probe_vb = probe["varbinds"]
-    probe_value = next(iter(probe_vb.values()), {}).get("value")
-    probe_type = next(iter(probe_vb.values()), {}).get("type", "")
-    if probe_value is None and probe_type in ("noSuchInstance", "noSuchObject"):
-        raise SnmpUnsupported(
-            "agent does not implement PRINTER-MIB (prtGeneralPrinterStatus missing)",
-            host=session.host_cfg.name,
-        )
-
-    printer_status_int = _int_or_none(probe_value)
-    printer_status_name = oids.PRT_GENERAL_STATUS_NAMES.get(
-        printer_status_int,
-        str(printer_status_int) if printer_status_int is not None else None,
-    )
+    probe_warnings: list[str] = []
 
     # Supplies (toner / ink / drum / ...) — prtMarkerSuppliesTable.
+    # Walk first; the rowcount is the real signal of PRINTER-MIB support.
+    # The earlier pre-flight on ``prtGeneralPrinterStatus.1.1`` was a poor
+    # proxy: some printers (e.g. OKI C530dn over v1) implement the supplies
+    # / input tables but do not expose that specific scalar sub-OID.
     supplies_table = await snmp_table(
         session,
         oids.PRT_MARKER_SUPPLIES_TABLE,
@@ -122,6 +112,36 @@ async def printer_status(session: HostSession) -> dict[str, Any]:
         for row in output_table["rows"]
     ]
 
+    # If neither supplies nor input trays produced any rows, the agent
+    # almost certainly does not implement PRINTER-MIB; raise so callers
+    # can distinguish "no data at all" from "printer with zero alerts".
+    if not supplies_table["rows"] and not input_table["rows"]:
+        raise SnmpUnsupported(
+            "agent does not implement PRINTER-MIB "
+            "(prtMarkerSuppliesTable and prtInputTable both empty)",
+            host=session.host_cfg.name,
+        )
+
+    # Opportunistic GET of prtGeneralPrinterStatus.1.1 — many printers
+    # expose it, some don't; either way we already have a useful payload
+    # from the table walks above. Tolerate v1 noSuchName silently.
+    printer_status_int: int | None = None
+    try:
+        probe = await snmp_get(session, [oids.PRT_GENERAL_PRINTER_STATUS + ".1.1"])
+    except SnmpNoSuchName:
+        probe = {"varbinds": {}, "warnings": []}
+        probe_warnings.append(
+            f"{oids.PRT_GENERAL_PRINTER_STATUS}.1.1: noSuchName (v1)"
+        )
+    else:
+        probe_vb = probe["varbinds"]
+        probe_value = next(iter(probe_vb.values()), {}).get("value")
+        printer_status_int = _int_or_none(probe_value)
+    printer_status_name = oids.PRT_GENERAL_STATUS_NAMES.get(
+        printer_status_int,
+        str(printer_status_int) if printer_status_int is not None else None,
+    )
+
     # Active alerts (printer panel alarms).
     alert_table = await snmp_table(
         session,
@@ -165,7 +185,8 @@ async def printer_status(session: HostSession) -> dict[str, Any]:
             "alerts": alerts,
         },
         "warnings": (
-            list(probe["warnings"])
+            list(probe_warnings)
+            + list(probe["warnings"])
             + list(supplies_table["warnings"])
             + list(input_table["warnings"])
             + list(output_table["warnings"])
