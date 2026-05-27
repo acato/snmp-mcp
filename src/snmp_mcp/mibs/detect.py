@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import oids
+from ..errors import SnmpNoSuchName
 from ..session import HostSession
 from ..transport import snmp_get
 
@@ -25,7 +26,17 @@ async def device_detect(session: HostSession) -> dict[str, Any]:
         oids.HR_SYSTEM_UPTIME,
         oids.PRT_GENERAL_PRINTER_STATUS + ".1.1",
     ]
-    result = await snmp_get(session, probe)
+    if session.host_cfg.version == "v1":
+        # SNMPv1's GET is all-or-nothing: if ANY OID in the request is
+        # unimplemented, the agent returns noSuchName (errorStatus=2) for
+        # the entire request. We pay N round-trips here to keep the probe
+        # robust against minimally-conformant v1 agents (e.g. OKI C530dn,
+        # which does not implement one of the supported probe OIDs).
+        # ``device_detect`` is rarely called and the probe set is small,
+        # so the latency cost is acceptable.
+        result = await _probe_per_oid(session, probe)
+    else:
+        result = await snmp_get(session, probe)
     vb = result["varbinds"]
 
     sys_object_id = _str_or_none(vb.get(oids.SYS_OBJECT_ID, {}).get("value"))
@@ -53,6 +64,27 @@ async def device_detect(session: HostSession) -> dict[str, Any]:
         },
         "warnings": result["warnings"],
     }
+
+
+async def _probe_per_oid(session: HostSession, probe: list[str]) -> dict[str, Any]:
+    """Issue one GET per OID; absorb ``noSuchName`` as a synthetic absent varbind.
+
+    SNMPv1 fails the whole request on any unimplemented OID. Catching the
+    error per-OID lets ``device_detect`` report partial MIB support the
+    same way it would for v2c+ noSuchObject markers.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for oid in probe:
+        try:
+            sub = await snmp_get(session, [oid])
+        except SnmpNoSuchName:
+            out[oid] = {"value": None, "type": "noSuchInstance"}
+            warnings.append(f"{oid}: noSuchName (v1)")
+            continue
+        out.update(sub["varbinds"])
+        warnings.extend(sub["warnings"])
+    return {"varbinds": out, "warnings": warnings}
 
 
 def _is_present(vb_entry: dict[str, Any]) -> bool:
