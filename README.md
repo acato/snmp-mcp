@@ -5,11 +5,12 @@ standard so AI agents (Claude Code, Claude Desktop, IDE assistants) can poll
 any SNMP-speaking device on the network without rediscovering each MIB's
 quirks on every task.
 
-**Status:** alpha. Feature-complete v0 — 9 tools (4 generic primitives, 5
+**Status:** beta. Feature-complete v0 — 9 tools (4 generic primitives, 5
 MIB-specific convenience wrappers) covering read-only inspection across
-switches, routers, printers, and host-resources targets. Unit tests + a
-live integration suite (gated on `SNMP_MCP_LIVE_HOST`). API is provisional
-until live integration has been exercised against multiple device classes.
+switches, routers, printers, and host-resources targets. 66 unit tests +
+9 live integration tests passing against two device classes (a managed
+RouterOS switch and an Epson print server with full PRINTER-MIB support).
+API is stable.
 See [DESIGN.md](DESIGN.md) for the full architecture, tool surface, and
 MIB-to-tool mapping.
 
